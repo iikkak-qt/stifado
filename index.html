@@ -441,63 +441,186 @@
     throw lastErr || new Error('all proxies failed');
   }
 
-  function htmlToCleanText(html) {
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-    // Replace <br> with newlines so the menu line structure survives
-    doc.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
-    // Replace block boundaries with newlines too
-    doc.querySelectorAll('p, div, li, h1, h2, h3, h4, strong, b').forEach(el => {
-      el.append('\n');
-    });
-    return doc.body.textContent
-      .replace(/\u00a0/g, ' ')
-      .split('\n')
-      .map(l => l.trim())
-      .filter(Boolean)
-      .join('\n');
-  }
+  function normalizeMenuText(text) {
+  return text
+    .replace(/\u00a0/g, ' ')
+    .replace(/\u200b/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n[ \t]+/g, '\n')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean);
+}
 
-  function findDaySection(text, dayName) {
-    // Look for "Maanantai 27.4" style header
-    const lines = text.split('\n');
-    const dayRegex = new RegExp(`^${dayName}\\s+\\d{1,2}\\.\\d{1,2}`, 'i');
-    const anyDayRegex = new RegExp(`^(${WEEKDAY_NAMES.join('|')})\\s+\\d{1,2}\\.\\d{1,2}`, 'i');
+/*
+ * Parse Marmoritupa's current HTML structure.
+ *
+ * Current structure is approximately:
+ *
+ *   Keskiviikko
+ *   30.9.
+ *   Paahdettua paprikakeittoa L, G
+ *   Jauhelihapihvejä...
+ *   ...
+ *
+ * Older versions sometimes had:
+ *
+ *   Keskiviikko 30.9
+ *   Paahdettua paprikakeittoa...
+ *
+ * Support both.
+ */
+function parseMenuSections(html) {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const sections = [];
 
-    let start = -1;
-    for (let i = 0; i < lines.length; i++) {
-      if (dayRegex.test(lines[i])) { start = i; break; }
-    }
-    if (start === -1) return null;
+  // First try the revised HTML structure.
+  const headings = [...doc.querySelectorAll('h2, h3, h4')];
 
-    let end = lines.length;
-    for (let i = start + 1; i < lines.length; i++) {
-      if (anyDayRegex.test(lines[i])) { end = i; break; }
-      // also stop at obvious footer markers
-      if (/^L=laktoositon|Lounas\s+\d|Lataa\s/i.test(lines[i])) { end = i; break; }
-    }
+  for (const heading of headings) {
+    const headingText = heading.textContent.trim();
 
-    const headerLine = lines[start];
-    const items = lines.slice(start + 1, end).filter(l => l && l.length > 1);
-    return { header: headerLine, items, raw: lines.slice(start, end).join('\n') };
-  }
+    const dayMatch = headingText.match(
+      /^(Maanantai|Tiistai|Keskiviikko|Torstai|Perjantai)(?:\s+(\d{1,2}\.\d{1,2}\.?))?$/i
+    );
 
-  function findStifadoDayThisWeek(text) {
-    const lines = text.split('\n');
-    const anyDayRegex = new RegExp(`^(${WEEKDAY_NAMES.join('|')})\\s+\\d{1,2}\\.\\d{1,2}`, 'i');
-    const sections = [];
-    let cur = null;
-    for (const line of lines) {
-      if (anyDayRegex.test(line)) {
-        if (cur) sections.push(cur);
-        cur = { header: line, body: [] };
-      } else if (cur) {
-        if (/^L=laktoositon|Lataa\s/i.test(line)) { sections.push(cur); cur = null; continue; }
-        cur.body.push(line);
+    if (!dayMatch) continue;
+
+    const dayName = dayMatch[1];
+    let date = dayMatch[2] || '';
+
+    const body = [];
+
+    // Walk forward until the next weekday heading.
+    let node = heading.nextElementSibling;
+
+    while (node) {
+      const text = node.textContent.trim();
+
+      // Stop at the next weekday heading.
+      if (
+        /^(Maanantai|Tiistai|Keskiviikko|Torstai|Perjantai)$/i.test(text) ||
+        /^(Maanantai|Tiistai|Keskiviikko|Torstai|Perjantai)\s+\d{1,2}\.\d{1,2}/i.test(text)
+      ) {
+        break;
       }
+
+      // Pick up a separate date element.
+      if (!date && /^\d{1,2}\.\d{1,2}\.?$/.test(text)) {
+        date = text;
+      }
+
+      // Extract individual menu items from lists.
+      const listItems = [...node.querySelectorAll(':scope > li')];
+
+      if (listItems.length) {
+        for (const li of listItems) {
+          const item = li.textContent.trim();
+          if (item) body.push(item);
+        }
+      } else {
+        // If this isn't a list, keep useful text.
+        // Avoid adding prices, headings and generic page text.
+        if (
+          text &&
+          !/^Päivän lounas$/i.test(text) &&
+          !/^Lounasaika/i.test(text) &&
+          !/^Lounas\s+\d/i.test(text) &&
+          !/^Salaatti/i.test(text) &&
+          !/^Lapset/i.test(text)
+        ) {
+          body.push(text);
+        }
+      }
+
+      node = node.nextElementSibling;
     }
-    if (cur) sections.push(cur);
-    return sections.find(s => /stifado/i.test(s.body.join(' ')));
+
+    if (body.length) {
+      sections.push({
+        header: `${dayName}${date ? ' ' + date : ''}`,
+        dayName,
+        date,
+        items: [...new Set(body)]
+      });
+    }
   }
+
+  if (sections.length) {
+    return sections;
+  }
+
+  // ------------------------------------------------------------
+  // Fallback for the old Marmoritupa HTML format.
+  // ------------------------------------------------------------
+
+  doc.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
+
+  doc.querySelectorAll(
+    'p, div, li, h1, h2, h3, h4, strong, b'
+  ).forEach(el => {
+    el.append('\n');
+  });
+
+  const text = normalizeMenuText(doc.body.textContent);
+  const lines = text;
+
+  const anyDayRegex = new RegExp(
+    `^(Maanantai|Tiistai|Keskiviikko|Torstai|Perjantai)(?:\\s+\\d{1,2}\\.\\d{1,2}\\.?|)$`,
+    'i'
+  );
+
+  let current = null;
+
+  for (const line of lines) {
+    const match = line.match(
+      /^(Maanantai|Tiistai|Keskiviikko|Torstai|Perjantai)\s*(\d{1,2}\.\d{1,2}\.?)?$/i
+    );
+
+    if (match) {
+      if (current) sections.push(current);
+
+      current = {
+        header: `${match[1]}${match[2] ? ' ' + match[2] : ''}`,
+        dayName: match[1],
+        date: match[2] || '',
+        items: []
+      };
+
+      continue;
+    }
+
+    if (!current) continue;
+
+    if (/^L=laktoositon|^Lounas\s+\d|^Lataa\s/i.test(line)) {
+      continue;
+    }
+
+    current.items.push(line);
+  }
+
+  if (current) sections.push(current);
+
+  return sections;
+}
+
+
+function findDaySection(html, dayName) {
+  const sections = parseMenuSections(html);
+
+  return sections.find(
+    section => section.dayName.toLowerCase() === dayName.toLowerCase()
+  ) || null;
+}
+
+
+function findStifadoDayThisWeek(html) {
+  const sections = parseMenuSections(html);
+
+  return sections.find(section =>
+    /stifado/i.test(section.items.join(' '))
+  ) || null;
+}
 
   function dayWordPartitive(dayHeader) {
     // "Tiistai 28.4" → "tiistaina"; "Keskiviikko" → "keskiviikkona"
